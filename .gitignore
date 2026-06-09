@@ -1,0 +1,8 @@
+.RData
+.Rhistory
+.Rproj.user/
+20260602.Rproj
+*.xlsx
+*.db
+plots/
+water_quality.db
