@@ -24,6 +24,8 @@ An end-to-end pipeline for ingesting Swedish freshwater monitoring data from Exc
 ├── 16 update_depth_ytvatten.sql           # Step 16 – Assign default depth for 'ytvatten' samples
 ├── 17 update_depth_botten.sql             # Step 17 – Assign default depth for 'botten' samples
 ├── 20 create_LOCATIONS.sql                # Step 20 – Create final deduplicated LOCATIONS table
+├── 21_convert_rt90_to_sweref99.R          # Step 21 – Convert RT90 coordinates to SWEREF99TM
+├── 22_update_locations_from_rt90.sql      # Step 22 – Write converted coordinates back to LOCATIONS
 │
 ├── map_interim_locations.R                # Plot sampling locations on a map of Sweden
 │
@@ -154,6 +156,33 @@ Creates **`LOCATIONS`** from `INTERIM_LOCATIONS`, retaining only rows where `LOC
 
 ---
 
+### Steps 21–22 — Convert legacy RT90 coordinates to SWEREF99TM
+
+Some locations in `LOCATIONS` may have coordinates stored in the older **RT90 2.5 gon V** system (EPSG:3021) rather than SWEREF99TM. These two scripts identify and reproject those locations.
+
+```r
+source("21_convert_rt90_to_sweref99.R")
+```
+```sql
+.read "22_update_locations_from_rt90.sql"
+```
+
+#### `21_convert_rt90_to_sweref99.R`
+
+Reads all rows from `LOCATIONS` where `KOORDINATSYSTEM` does not indicate SWEREF99, then:
+
+1. Detects and fixes **truncated 6-digit coordinates** — RT90 coordinates are always 7 digits, so values with only 6 digits are missing their leading digit and are corrected by multiplying by 10 (eastings < 200,000; northings between 200,000 and 999,999).
+2. Reprojects both station and provplats coordinate pairs from RT90 2.5 gon V (EPSG:3021) to SWEREF99TM (EPSG:3006) using the `sf` package.
+3. Writes results to a new staging table **`RT90_TO_SWEREF99`** — the original `LOCATIONS` table is not modified at this stage.
+
+The source CRS can be changed at the top of the script if a different RT90 variant is present.
+
+#### `22_update_locations_from_rt90.sql`
+
+Reads from `RT90_TO_SWEREF99` and updates `LOCATIONS` in place for all rows where station coordinates were successfully converted. Provplats coordinates are updated where available. Sets `KOORDINATSYSTEM = 'SWEREF99TM'` and `QC = 'coordinates from RT90'` on all updated rows. Includes a preview `SELECT` and two verification queries (row counts by QC/CRS, and any remaining non-SWEREF rows).
+
+---
+
 ### Visualisations
 
 #### Map of sampling locations
@@ -255,6 +284,28 @@ Final deduplicated location table; subset of `INTERIM_LOCATIONS` where `LOCATION
 | `KOORDINATSYSTEM` | TEXT |
 | `PROVTAGNINGSMEDIUM` | TEXT |
 | `QC` | TEXT |
+
+### `RT90_TO_SWEREF99`
+
+Staging table of reprojected coordinates produced by `21_convert_rt90_to_sweref99.R`.
+
+| Column | Type |
+| --- | --- |
+| `LOCATION_ID` | INTEGER |
+| `ORIGINAL_KOORDINATSYSTEM` | TEXT |
+| `ORIGINAL_STATIONSKOORDINAT_N_X` | TEXT |
+| `ORIGINAL_STATIONSKOORDINAT_E_Y` | TEXT |
+| `ORIGINAL_PROVPLATSKOORDINAT_N_X` | TEXT |
+| `ORIGINAL_PROVPLATSKOORDINAT_E_Y` | TEXT |
+| `EASTING_TRUNCATION_FIXED` | INTEGER (0/1) |
+| `NORTHING_TRUNCATION_FIXED` | INTEGER (0/1) |
+| `SWEREF99TM_STATIONSKOORDINAT_N` | REAL |
+| `SWEREF99TM_STATIONSKOORDINAT_E` | REAL |
+| `SWEREF99TM_PROVPLATSKOORDINAT_N` | REAL |
+| `SWEREF99TM_PROVPLATSKOORDINAT_E` | REAL |
+| `SOURCE_CRS` | INTEGER |
+| `TARGET_CRS` | INTEGER |
+| `CONVERSION_DATE` | TEXT |
 
 ### Indexes
 
