@@ -4,5 +4,6 @@
 20260602.Rproj
 *.xlsx
 *.db
+*.db_journal
 plots/
 water_quality.db
