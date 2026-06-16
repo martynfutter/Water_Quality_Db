@@ -1,6 +1,6 @@
 # Water Quality Database Pipeline
 
-An end-to-end pipeline for ingesting Swedish freshwater monitoring data from Excel, building a normalised SQLite database, quality-controlling measured values, and producing N:P stoichiometry plots.
+An end-to-end pipeline for ingesting Swedish freshwater monitoring data from Excel, building a normalised SQLite database, quality-controlling measured values, producing N:P stoichiometry plots, and identifying duplicate samples.
 
 ---
 
@@ -35,6 +35,9 @@ An end-to-end pipeline for ingesting Swedish freshwater monitoring data from Exc
 ├── 34_create_COMPONENT_QC.sql                 # Step 34 – Create and populate COMPONENT_QC table
 ├── 35_add_DIN_to_STOICHIOMETRY_INPUTS.sql     # Step 35 – Add DIN and DIN_QC columns
 ├── 36_add_TOTAL_N_to_STOICHIOMETRY_INPUTS.sql # Step 36 – Add TOTAL_N and TOTAL_N_QC columns
+├── 40_create_vw_source_rowid_stats.sql        # Step 40 – Create summary statistics view per SOURCE_ROWID
+├── 41_create_DUPLICATE_CANDIDATES.sql         # Step 41 – Identify groups of potential duplicate samples
+├── 42_create_DUPLICATE_SOURCE_ROWIDS.sql      # Step 42 – Resolve duplicate groups to individual SOURCE_ROWIDs
 │
 ├── map_interim_locations.R                    # Plot sampling locations on a map of Sweden
 │
@@ -189,20 +192,22 @@ Reads from `RT90_TO_SWEREF99` and updates `LOCATIONS` in place for all rows wher
 
 ---
 
-### Step 25 — Create NAMES_TO_USE lookup table
+### Step 25 — Create PARAMETER_LOOKUP table
 
 ```sql
 .read "25 create_NAMES_TO_USE.sql"
 ```
 
-Creates **`NAMES_TO_USE`** — a lookup table mapping the sanitised `PARAMETER_NAME` values in `RESULTS` to standardised English parameter codes and units. Used by the view created in step 26.
+Creates **`PARAMETER_LOOKUP`** — a lookup table mapping the sanitised `PARAMETER_NAME` values in `RESULTS` to standardised English parameter codes, species, element, units, and molar mass. Used by the view created in step 26.
 
-| Column              | Description                              |
-| ------------------- | ---------------------------------------- |
-| `NAMES_TO_USE_ID`   | Auto-increment primary key               |
-| `PARAMETER_NAME`    | Sanitised name as it appears in RESULTS  |
-| `STANDARD_NAME`     | Standardised English parameter code      |
-| `UNITS`             | Units of measurement                     |
+| Column                | Description                              |
+| --------------------- | ---------------------------------------- |
+| `PARAMETER_NAME`      | Primary key; sanitised name from RESULTS |
+| `NAME_TO_USE`         | Standardised English parameter code      |
+| `SPECIES`             | Chemical species                         |
+| `ELEMENT`             | Element (e.g. NITROGEN, PHOSPHORUS)      |
+| `UNITS`               | Units of measurement                     |
+| `ELEMENT_MOLAR_MASS_G`| Molar mass of the element (g/mol)        |
 
 ---
 
@@ -212,7 +217,7 @@ Creates **`NAMES_TO_USE`** — a lookup table mapping the sanitised `PARAMETER_N
 .read "26 create_RESULTS_view.sql"
 ```
 
-Creates the view **`vw_results_with_lookup`** — joins `RESULTS` to `NAMES_TO_USE` on `PARAMETER_NAME`, providing `STANDARD_NAME` and `UNITS` alongside all `RESULTS` columns for convenient querying without needing to write the join manually each time.
+Creates the view **`vw_results_with_lookup`** — joins `RESULTS` to `PARAMETER_LOOKUP` on `PARAMETER_NAME` (LEFT JOIN, so all `RESULTS` rows are retained even if not yet mapped). Provides `NAME_TO_USE`, `SPECIES`, `ELEMENT`, `UNITS`, and `ELEMENT_MOLAR_MASS_G` alongside all `RESULTS` columns for convenient querying.
 
 ---
 
@@ -222,19 +227,17 @@ Creates the view **`vw_results_with_lookup`** — joins `RESULTS` to `NAMES_TO_U
 .read "30_create_STOICHIOMETRY_INPUTS.sql"
 ```
 
-Creates **`STOICHIOMETRY_INPUTS`** — one row per sampling event, drawing metadata from `INTERIM_SAMPLES` and providing columns for the nutrient values needed for N:P stoichiometry calculations. Includes a `DATESTAMP` column that is updated as values are populated in subsequent steps.
+Creates **`STOICHIOMETRY_INPUTS`** — one row per sampling event that has a non-NULL `TOTAL_PHOSPHORUS` value, drawn from `vw_results_with_lookup`. Additional nutrient columns (`DIN`, `TOTAL_N` and their QC flags) are added by later steps.
 
-| Column                  | Type                        | Description                                      |
-| ----------------------- | --------------------------- | ------------------------------------------------ |
-| `STOICHIOMETRY_ID`      | INTEGER (PK, AUTOINCREMENT) | System-generated primary key                     |
-| `SOURCE_ROWID`          | INTEGER                     | Links to `RAW_DATA` and `RESULTS`                |
-| `DATESTAMP`             | TEXT                        | Date/time the row was last updated               |
-| `TOTAL_PHOSPHORUS`      | REAL                        | Total phosphorus (µg/l P)                        |
-| `TOTAL_PHOSPHORUS_QC`   | INTEGER                     | FK to `COMPONENT_QC.COMPONENT_QC_ID`             |
-| `DIN`                   | REAL                        | Dissolved inorganic nitrogen (µg/l N)            |
-| `DIN_QC`                | INTEGER                     | FK to `COMPONENT_QC.COMPONENT_QC_ID`             |
-| `TOTAL_N`               | REAL                        | Total nitrogen (µg/l N)                          |
-| `TOTAL_N_QC`            | INTEGER                     | FK to `COMPONENT_QC.COMPONENT_QC_ID`             |
+| Column                | Type         | Description                                      |
+| --------------------- | ------------ | ------------------------------------------------ |
+| `SOURCE_ROWID`        | INTEGER (PK) | Links to `RAW_DATA` and `RESULTS`                |
+| `DATESTAMP`           | TEXT         | Date/time the row was last updated               |
+| `TOTAL_PHOSPHORUS`    | REAL         | Total phosphorus (µg/l P)                        |
+| `DIN`                 | REAL         | Dissolved inorganic nitrogen (µg/l N)            |
+| `DIN_QC`              | INTEGER      | FK to `COMPONENT_QC.COMPONENT_QC_ID`             |
+| `TOTAL_N`             | REAL         | Total nitrogen (µg/l N)                          |
+| `TOTAL_N_QC`          | INTEGER      | FK to `COMPONENT_QC.COMPONENT_QC_ID`             |
 
 ---
 
@@ -244,7 +247,18 @@ Creates **`STOICHIOMETRY_INPUTS`** — one row per sampling event, drawing metad
 .read "31_create_STOICHIOMETRY_NITROGEN.sql"
 ```
 
-Creates **`STOICHIOMETRY_NITROGEN`** — a staging table holding the individual nitrogen-fraction values (e.g. nitrate, nitrite, ammonium, total nitrogen) extracted from `vw_results_with_lookup` for each sampling event. Used as the source for the DIN and total nitrogen views in steps 32–33.
+Creates **`STOICHIOMETRY_NITROGEN`** — a wide-format (crosstab) staging table holding individual nitrogen fraction values per sampling event, pivoted from `vw_results_with_lookup` where `ELEMENT = 'NITROGEN'`. Used as the source for the DIN and total nitrogen views in steps 32–33.
+
+| Column                         | Description                               |
+| ------------------------------ | ----------------------------------------- |
+| `SOURCE_ROWID`                 | INTEGER (PK); links to `RAW_DATA`         |
+| `DATESTAMP`                    | Date/time the row was populated           |
+| `AMMONIUM_AS_N`                | NH4-N (µg/l N)                            |
+| `NITRATE_AS_N`                 | NO3-N (µg/l N)                            |
+| `NITRITE_AS_N`                 | NO2-N (µg/l N)                            |
+| `ORGANIC_NITROGEN_AS_N`        | Org-N (µg/l N)                            |
+| `TOTAL_KJELDAHL_NITROGEN_AS_N` | Kjeldahl-N (µg/l N)                       |
+| `TOTAL_NITROGEN`               | Tot-N (µg/l N)                            |
 
 ---
 
@@ -254,13 +268,13 @@ Creates **`STOICHIOMETRY_NITROGEN`** — a staging table holding the individual 
 .read "32_create_vw_DIN.sql"
 ```
 
-Creates the view **`vw_DIN`** — calculates dissolved inorganic nitrogen (DIN) as N for each sampling event by summing the available inorganic nitrogen fractions from `STOICHIOMETRY_NITROGEN`. Includes a `COMPONENTS` column describing which fractions were available and used in the calculation (e.g. `NO3-N + NO2-N + NH4-N`).
+Creates the view **`vw_DIN`** — calculates dissolved inorganic nitrogen (DIN) as N for each sampling event by summing available inorganic nitrogen fractions from `STOICHIOMETRY_NITROGEN`. The `COMPONENTS` column describes which fractions were used.
 
-| Column         | Description                                          |
-| -------------- | ---------------------------------------------------- |
-| `SOURCE_ROWID` | Links to `RAW_DATA`                                  |
-| `DIN_AS_N`     | Calculated DIN value (µg/l N)                        |
-| `COMPONENTS`   | Description of nitrogen fractions used in calculation |
+| Case | Fractions used                    |
+| ---- | --------------------------------- |
+| 1    | NH4-N + NO2-N + NO3-N (all three) |
+| 2    | NH4-N + NO3-N (NO2-N absent)      |
+| 3    | NO3-N only                        |
 
 ---
 
@@ -270,13 +284,13 @@ Creates the view **`vw_DIN`** — calculates dissolved inorganic nitrogen (DIN) 
 .read "33_create_vw_total_n.sql"
 ```
 
-Creates the view **`vw_total_n`** — derives total nitrogen as N for each sampling event from `STOICHIOMETRY_NITROGEN`, preferring a directly measured total nitrogen value where available, and falling back to DIN (from `vw_DIN`) where it is not. Includes a `COMPONENTS` column describing the source of the value.
+Creates the view **`vw_total_n`** — derives total nitrogen as N per sampling event from `STOICHIOMETRY_NITROGEN`, preferring a directly measured total nitrogen value and falling back through Kjeldahl+nitrate, then organic N+DIN.
 
-| Column              | Description                                        |
-| ------------------- | -------------------------------------------------- |
-| `SOURCE_ROWID`      | Links to `RAW_DATA`                                |
-| `TOTAL_NITROGEN_AS_N` | Total nitrogen value (µg/l N)                    |
-| `COMPONENTS`        | Description of the source used for the calculation |
+| Case | Source                                  |
+| ---- | --------------------------------------- |
+| 1    | `TOTAL_NITROGEN` directly               |
+| 2    | `TOTAL_KJELDAHL_NITROGEN_AS_N + NITRATE_AS_N` |
+| 3    | `ORGANIC_NITROGEN_AS_N + DIN` (from `vw_DIN`) |
 
 ---
 
@@ -286,13 +300,13 @@ Creates the view **`vw_total_n`** — derives total nitrogen as N for each sampl
 .read "34_create_COMPONENT_QC.sql"
 ```
 
-Creates and populates **`COMPONENT_QC`** — a lookup table of the distinct `COMPONENTS` strings found across `vw_DIN` and `vw_total_n`. Each unique string receives a system-generated integer primary key (`COMPONENT_QC_ID`) which is used as a quality-control foreign key in `STOICHIOMETRY_INPUTS`. A `SOURCE_VIEW` column records which view(s) the components string originated from.
+Creates and populates **`COMPONENT_QC`** — a lookup table of the distinct `COMPONENTS` strings found across `vw_DIN` and `vw_total_n`. Each unique string receives a system-generated integer primary key (`COMPONENT_QC_ID`) used as a quality-control foreign key in `STOICHIOMETRY_INPUTS`.
 
-| Column             | Type                        | Description                                          |
-| ------------------ | --------------------------- | ---------------------------------------------------- |
-| `COMPONENT_QC_ID`  | INTEGER (PK, AUTOINCREMENT) | System-generated primary key                         |
-| `COMPONENTS`       | TEXT                        | Description of nitrogen fractions used               |
-| `SOURCE_VIEW`      | TEXT                        | `vw_DIN`, `vw_total_n`, or `vw_DIN, vw_total_n`     |
+| Column            | Type                        | Description                                      |
+| ----------------- | --------------------------- | ------------------------------------------------ |
+| `COMPONENT_QC_ID` | INTEGER (PK, AUTOINCREMENT) | System-generated primary key                     |
+| `COMPONENTS`      | TEXT                        | Description of nitrogen fractions used           |
+| `SOURCE_VIEW`     | TEXT                        | `vw_DIN`, `vw_total_n`, or `vw_DIN, vw_total_n` |
 
 ---
 
@@ -302,12 +316,7 @@ Creates and populates **`COMPONENT_QC`** — a lookup table of the distinct `COM
 .read "35_add_DIN_to_STOICHIOMETRY_INPUTS.sql"
 ```
 
-Adds two columns to `STOICHIOMETRY_INPUTS` and populates them from `vw_DIN` and `COMPONENT_QC`:
-
-- **`DIN`** (REAL) — populated with `vw_DIN.DIN_AS_N` where `vw_DIN.SOURCE_ROWID = STOICHIOMETRY_INPUTS.SOURCE_ROWID`
-- **`DIN_QC`** (INTEGER) — populated with `COMPONENT_QC.COMPONENT_QC_ID` where `COMPONENT_QC.COMPONENTS = vw_DIN.COMPONENTS`
-
-`DATESTAMP` is updated to the time the query was run for all rows where a non-NULL `DIN` value was found. Rows with no match in `vw_DIN` are left unchanged.
+Adds `DIN` (REAL) and `DIN_QC` (INTEGER) columns to `STOICHIOMETRY_INPUTS`, populating them from `vw_DIN` and `COMPONENT_QC` respectively. `DATESTAMP` is updated for all rows where a non-NULL DIN value was found.
 
 ---
 
@@ -317,12 +326,63 @@ Adds two columns to `STOICHIOMETRY_INPUTS` and populates them from `vw_DIN` and 
 .read "36_add_TOTAL_N_to_STOICHIOMETRY_INPUTS.sql"
 ```
 
-Adds two columns to `STOICHIOMETRY_INPUTS` and populates them from `vw_total_n` and `COMPONENT_QC`:
+Adds `TOTAL_N` (REAL) and `TOTAL_N_QC` (INTEGER) columns to `STOICHIOMETRY_INPUTS`, populating them from `vw_total_n` and `COMPONENT_QC` respectively. `DATESTAMP` is updated for all rows where a non-NULL total nitrogen value was found.
 
-- **`TOTAL_N`** (REAL) — populated with `vw_total_n.TOTAL_NITROGEN_AS_N` where `vw_total_n.SOURCE_ROWID = STOICHIOMETRY_INPUTS.SOURCE_ROWID`
-- **`TOTAL_N_QC`** (INTEGER) — populated with `COMPONENT_QC.COMPONENT_QC_ID` where `COMPONENT_QC.COMPONENTS = vw_total_n.COMPONENTS`
+---
 
-`DATESTAMP` is updated to the time the query was run for all rows where a non-NULL `TOTAL_N` value was found. Rows with no match in `vw_total_n` are left unchanged.
+### Step 40 — Create vw_source_rowid_stats view
+
+```sql
+.read "40_create_vw_source_rowid_stats.sql"
+```
+
+Creates the view **`vw_source_rowid_stats`** — aggregates `RESULTS` by `SOURCE_ROWID`, computing summary statistics over `NUMERIC_VALUE` across all parameters for each sampling event. This is the first step in identifying duplicate samples; `SOURCE_ROWID`s with identical statistics are candidates for further inspection.
+
+Only rows where `NUMERIC_VALUE IS NOT NULL` contribute to the aggregates. `STDEV_NUMERIC_VALUE` is computed manually as `SQRT(AVG(x²) − AVG(x)²)` (population standard deviation) since SQLite has no built-in `STDDEV` function; it is `NULL` when fewer than two values are present.
+
+| Column              | Description                                                    |
+| ------------------- | -------------------------------------------------------------- |
+| `SOURCE_ROWID`      | Sampling event identifier (links to `RAW_DATA`)                |
+| `N_PARAMETERS`      | Count of parameters with a non-NULL `NUMERIC_VALUE`            |
+| `SUM_NUMERIC_VALUE` | Sum of `NUMERIC_VALUE` across all parameters                   |
+| `AVG_NUMERIC_VALUE` | Mean of `NUMERIC_VALUE` across all parameters                  |
+| `STDEV_NUMERIC_VALUE` | Population standard deviation of `NUMERIC_VALUE`             |
+
+---
+
+### Step 41 — Create DUPLICATE_CANDIDATES table
+
+```sql
+.read "41_create_DUPLICATE_CANDIDATES.sql"
+```
+
+Creates and populates **`DUPLICATE_CANDIDATES`** from `vw_source_rowid_stats`. Groups `SOURCE_ROWID`s by all four summary statistics and counts how many share identical values. Any group with `N_SOURCE_ROWIDS > 1` is a candidate set of duplicate samples. Results are ordered with the largest duplicate groups first.
+
+| Column              | Type                        | Description                                                  |
+| ------------------- | --------------------------- | ------------------------------------------------------------ |
+| `TUPLE_ID`          | INTEGER (PK, AUTOINCREMENT) | System-generated primary key identifying each duplicate group |
+| `N_PARAMETERS`      | INTEGER                     | Count of parameters with a non-NULL `NUMERIC_VALUE`          |
+| `SUM_NUMERIC_VALUE` | REAL                        | Sum of `NUMERIC_VALUE` across all parameters                 |
+| `AVG_NUMERIC_VALUE` | REAL                        | Mean of `NUMERIC_VALUE` across all parameters                |
+| `STDEV_NUMERIC_VALUE` | REAL                      | Population standard deviation of `NUMERIC_VALUE`             |
+| `N_SOURCE_ROWIDS`   | INTEGER                     | Count of `SOURCE_ROWID`s sharing these statistics            |
+
+---
+
+### Step 42 — Create DUPLICATE_SOURCE_ROWIDS table
+
+```sql
+.read "42_create_DUPLICATE_SOURCE_ROWIDS.sql"
+```
+
+Creates and populates **`DUPLICATE_SOURCE_ROWIDS`** — joins `DUPLICATE_CANDIDATES` back to `vw_source_rowid_stats` on all four summary statistic columns to recover the individual `SOURCE_ROWID`s belonging to each duplicate group. Only groups where `N_SOURCE_ROWIDS > 1` are included. The join handles `NULL = NULL` correctly for `STDEV_NUMERIC_VALUE` (rows with only one numeric value where standard deviation is `NULL`).
+
+| Column          | Type    | Description                                          |
+| --------------- | ------- | ---------------------------------------------------- |
+| `TUPLE_ID`      | INTEGER | FK to `DUPLICATE_CANDIDATES.TUPLE_ID`                |
+| `SOURCE_ROWID`  | INTEGER | Individual sampling event identifier                 |
+| `N_SOURCE_ROWIDS` | INTEGER | Number of `SOURCE_ROWID`s in this duplicate group  |
+| `DATESTAMP`     | TEXT    | Date the query was run                               |
 
 ---
 
@@ -341,13 +401,13 @@ Reads `INTERIM_LOCATIONS` from the database, reprojects coordinates from **SWERE
 
 ## Parameter name mapping
 
-`names_to_use.csv` maps original Swedish column headers to standardised English parameter codes and units. Useful reference when querying `RESULTS` by `PARAMETER_NAME`.
+`PARAMETER_LOOKUP` maps original Swedish column headers to standardised English parameter codes and units. Useful reference when querying `RESULTS` by `PARAMETER_NAME`.
 
 | Original name           | Standardised name | Units |
 | ----------------------- | ----------------- | ----- |
-| `Tot-P (µg/l P)`        | `TOTP-P`          | µg/l  |
-| `Tot-N (µg/l N)`        | `TOTN-N`          | µg/l  |
-| `NO2+NO3-N (µg/l N)`    | `NO3-N`           | µg/l  |
+| `Tot-P (µg/l P)`        | `TOTAL_PHOSPHORUS`| µg/l  |
+| `Tot-N (µg/l N)`        | `TOTAL_NITROGEN`  | µg/l  |
+| `NO2+NO3-N (µg/l N)`    | `NITRATE_AS_N`    | µg/l  |
 | `Vattentemperatur (°C)` | `TEMPERATURE`     | °C    |
 | `Siktdjup (m)`          | `SECCHI`          | m     |
 | `pH`                    | `PH`              | —     |
@@ -464,16 +524,18 @@ Staging table of reprojected coordinates produced by `21_convert_rt90_to_sweref9
 
 ---
 
-### `NAMES_TO_USE`
+### `PARAMETER_LOOKUP`
 
 Parameter name lookup table linking `RESULTS.PARAMETER_NAME` to standardised codes and units.
 
-| Column            | Type                        |
-| ----------------- | --------------------------- |
-| `NAMES_TO_USE_ID` | INTEGER (PK, AUTOINCREMENT) |
-| `PARAMETER_NAME`  | TEXT                        |
-| `STANDARD_NAME`   | TEXT                        |
-| `UNITS`           | TEXT                        |
+| Column                | Type         |
+| --------------------- | ------------ |
+| `PARAMETER_NAME`      | TEXT (PK)    |
+| `NAME_TO_USE`         | TEXT         |
+| `SPECIES`             | TEXT         |
+| `ELEMENT`             | TEXT         |
+| `UNITS`               | TEXT         |
+| `ELEMENT_MOLAR_MASS_G`| REAL         |
 
 ---
 
@@ -481,23 +543,32 @@ Parameter name lookup table linking `RESULTS.PARAMETER_NAME` to standardised cod
 
 Staging table of individual nitrogen fraction values per sampling event, used as the source for `vw_DIN` and `vw_total_n`.
 
+| Column                         | Type         |
+| ------------------------------ | ------------ |
+| `SOURCE_ROWID`                 | INTEGER (PK) |
+| `DATESTAMP`                    | TEXT         |
+| `AMMONIUM_AS_N`                | REAL         |
+| `NITRATE_AS_N`                 | REAL         |
+| `NITRITE_AS_N`                 | REAL         |
+| `ORGANIC_NITROGEN_AS_N`        | REAL         |
+| `TOTAL_KJELDAHL_NITROGEN_AS_N` | REAL         |
+| `TOTAL_NITROGEN`               | REAL         |
+
 ---
 
 ### `STOICHIOMETRY_INPUTS`
 
 One row per sampling event; holds nutrient values for N:P stoichiometry calculations.
 
-| Column                | Type                        | Description                              |
-| --------------------- | --------------------------- | ---------------------------------------- |
-| `STOICHIOMETRY_ID`    | INTEGER (PK, AUTOINCREMENT) | System-generated primary key             |
-| `SOURCE_ROWID`        | INTEGER                     | Links to `RAW_DATA` and `RESULTS`        |
-| `DATESTAMP`           | TEXT                        | Date/time the row was last updated       |
-| `TOTAL_PHOSPHORUS`    | REAL                        | Total phosphorus (µg/l P)                |
-| `TOTAL_PHOSPHORUS_QC` | INTEGER                     | FK to `COMPONENT_QC.COMPONENT_QC_ID`    |
-| `DIN`                 | REAL                        | Dissolved inorganic nitrogen (µg/l N)    |
-| `DIN_QC`              | INTEGER                     | FK to `COMPONENT_QC.COMPONENT_QC_ID`    |
-| `TOTAL_N`             | REAL                        | Total nitrogen (µg/l N)                  |
-| `TOTAL_N_QC`          | INTEGER                     | FK to `COMPONENT_QC.COMPONENT_QC_ID`    |
+| Column                | Type         | Description                                      |
+| --------------------- | ------------ | ------------------------------------------------ |
+| `SOURCE_ROWID`        | INTEGER (PK) | Links to `RAW_DATA` and `RESULTS`                |
+| `DATESTAMP`           | TEXT         | Date/time the row was last updated               |
+| `TOTAL_PHOSPHORUS`    | REAL         | Total phosphorus (µg/l P)                        |
+| `DIN`                 | REAL         | Dissolved inorganic nitrogen (µg/l N)            |
+| `DIN_QC`              | INTEGER      | FK to `COMPONENT_QC.COMPONENT_QC_ID`             |
+| `TOTAL_N`             | REAL         | Total nitrogen (µg/l N)                          |
+| `TOTAL_N_QC`          | INTEGER      | FK to `COMPONENT_QC.COMPONENT_QC_ID`             |
 
 ---
 
@@ -513,13 +584,42 @@ Lookup table of distinct nitrogen component combinations used in stoichiometry c
 
 ---
 
+### `DUPLICATE_CANDIDATES`
+
+Groups of `SOURCE_ROWID`s that share identical summary statistics across all measured parameters, indicating potential duplicate samples.
+
+| Column              | Type                        | Description                                                   |
+| ------------------- | --------------------------- | ------------------------------------------------------------- |
+| `TUPLE_ID`          | INTEGER (PK, AUTOINCREMENT) | System-generated primary key identifying each duplicate group  |
+| `N_PARAMETERS`      | INTEGER                     | Count of parameters with a non-NULL `NUMERIC_VALUE`           |
+| `SUM_NUMERIC_VALUE` | REAL                        | Sum of `NUMERIC_VALUE` across all parameters                  |
+| `AVG_NUMERIC_VALUE` | REAL                        | Mean of `NUMERIC_VALUE` across all parameters                 |
+| `STDEV_NUMERIC_VALUE` | REAL                      | Population standard deviation of `NUMERIC_VALUE`              |
+| `N_SOURCE_ROWIDS`   | INTEGER                     | Count of `SOURCE_ROWID`s sharing these statistics             |
+
+---
+
+### `DUPLICATE_SOURCE_ROWIDS`
+
+Individual `SOURCE_ROWID`s belonging to each duplicate candidate group.
+
+| Column          | Type    | Description                                          |
+| --------------- | ------- | ---------------------------------------------------- |
+| `TUPLE_ID`      | INTEGER | FK to `DUPLICATE_CANDIDATES.TUPLE_ID`                |
+| `SOURCE_ROWID`  | INTEGER | Individual sampling event identifier                 |
+| `N_SOURCE_ROWIDS` | INTEGER | Number of `SOURCE_ROWID`s in this duplicate group  |
+| `DATESTAMP`     | TEXT    | Date the query was run                               |
+
+---
+
 ### Views
 
-| View                     | Description                                                                                          |
-| ------------------------ | ---------------------------------------------------------------------------------------------------- |
-| `vw_results_with_lookup` | Joins `RESULTS` to `NAMES_TO_USE`, adding `STANDARD_NAME` and `UNITS` to each row                   |
-| `vw_DIN`                 | Calculates DIN as N per sampling event from `STOICHIOMETRY_NITROGEN`; includes `COMPONENTS` column  |
-| `vw_total_n`             | Derives total nitrogen as N per sampling event; prefers measured value, falls back to DIN            |
+| View                     | Description                                                                                                          |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| `vw_results_with_lookup` | Joins `RESULTS` to `PARAMETER_LOOKUP`, adding `NAME_TO_USE`, `SPECIES`, `ELEMENT`, `UNITS`, and molar mass to each row |
+| `vw_DIN`                 | Calculates DIN as N per sampling event from `STOICHIOMETRY_NITROGEN`; includes `COMPONENTS` column                  |
+| `vw_total_n`             | Derives total nitrogen as N per sampling event; prefers measured value, falls back to derived estimates              |
+| `vw_source_rowid_stats`  | Aggregates `RESULTS` by `SOURCE_ROWID`, computing N, sum, mean, and population std dev of `NUMERIC_VALUE`           |
 
 ---
 
