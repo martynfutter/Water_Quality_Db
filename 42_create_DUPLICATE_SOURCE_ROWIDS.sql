@@ -14,6 +14,7 @@
 --   TUPLE_ID            – FK to DUPLICATE_CANDIDATES.TUPLE_ID
 --   SOURCE_ROWID        – individual sampling event identifier
 --   N_SOURCE_ROWIDS     – number of SOURCE_ROWIDs in this duplicate group
+--   USE_SAMPLE          – flag for downstream use; defaults to 'Y'
 --   DATESTAMP           – date the query was run
 -- =============================================================================
 
@@ -23,6 +24,7 @@ CREATE TABLE DUPLICATE_SOURCE_ROWIDS (
     TUPLE_ID        INTEGER NOT NULL,
     SOURCE_ROWID    INTEGER NOT NULL,
     N_SOURCE_ROWIDS INTEGER NOT NULL,
+    USE_SAMPLE      TEXT    NOT NULL DEFAULT 'Y',
     DATESTAMP       TEXT    NOT NULL
 );
 
@@ -35,13 +37,15 @@ INSERT INTO DUPLICATE_SOURCE_ROWIDS (
     TUPLE_ID,
     SOURCE_ROWID,
     N_SOURCE_ROWIDS,
+    USE_SAMPLE,
     DATESTAMP
 )
 SELECT
     DC.TUPLE_ID,
     VS.SOURCE_ROWID,
     DC.N_SOURCE_ROWIDS,
-    DATE('now')             AS DATESTAMP
+    'Y'             AS USE_SAMPLE,
+    DATE('now')     AS DATESTAMP
 FROM DUPLICATE_CANDIDATES DC
 JOIN vw_source_rowid_stats VS
     ON  VS.N_PARAMETERS        = DC.N_PARAMETERS
@@ -59,10 +63,10 @@ ORDER BY DC.TUPLE_ID, VS.SOURCE_ROWID;
 -- =============================================================================
 
 SELECT
-    COUNT(*)                    AS total_rows,
-    COUNT(DISTINCT TUPLE_ID)    AS duplicate_groups,
-    COUNT(DISTINCT SOURCE_ROWID) AS distinct_source_rowids,
-    MIN(DATESTAMP)              AS datestamp
+    COUNT(*)                        AS total_rows,
+    COUNT(DISTINCT TUPLE_ID)        AS duplicate_groups,
+    COUNT(DISTINCT SOURCE_ROWID)    AS distinct_source_rowids,
+    MIN(DATESTAMP)                  AS datestamp
 FROM DUPLICATE_SOURCE_ROWIDS;
 
 -- Preview
