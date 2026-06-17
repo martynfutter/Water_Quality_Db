@@ -38,10 +38,9 @@ An end-to-end pipeline for ingesting Swedish freshwater monitoring data from Exc
 ├── 40_create_vw_source_rowid_stats.sql        # Step 40  – Create summary statistics view per SOURCE_ROWID
 ├── 41_create_DUPLICATE_CANDIDATES.sql         # Step 41  – Identify groups of potential duplicate samples
 ├── 42_create_DUPLICATE_SOURCE_ROWIDS.sql      # Step 42  – Resolve duplicate groups to individual SOURCE_ROWIDs
-│
-├── update_water_quality_db.R                  # R alternative to SQL steps 1–3 (batch UPDATE via DBI)
-├── map_interim_locations.R                    # Plot sampling locations on a map of Sweden
-├── plot_NP_final.R                            # Produce N:P stoichiometry 2×2 panel plot
+├── 43_create_vw_duplicate_samples.sql         # Step 43  – View joining duplicate candidates to sample metadata
+├── 44_update_DUPLICATE_SOURCE_ROWIDS.sql      # Step 44  – Flag smaller SOURCE_ROWID in each pair as discarded
+├── 45_create_vw_stoichiometry_inputs_deduped.sql  # Step 45  – Deduplicated view of STOICHIOMETRY_INPUTS
 │
 ├── .gitignore
 └── README.MD
@@ -367,14 +366,45 @@ Creates **`DUPLICATE_CANDIDATES`** by grouping `vw_source_rowid_stats` on its ag
 .read "42_create_DUPLICATE_SOURCE_ROWIDS.sql"
 ```
 
-Creates **`DUPLICATE_SOURCE_ROWIDS`** — resolves each duplicate candidate group to its individual member `SOURCE_ROWID`s for further inspection or flagging.
+Creates **`DUPLICATE_SOURCE_ROWIDS`** — resolves each duplicate candidate group to its individual member `SOURCE_ROWID`s. Defaults `USE_SAMPLE = 'Y'` for all rows; this flag is updated by script 44 to mark which duplicates should be discarded.
 
-| Column            | Type    | Description                                       |
-| ----------------- | ------- | ------------------------------------------------- |
-| `TUPLE_ID`        | INTEGER | FK → `DUPLICATE_CANDIDATES.TUPLE_ID`              |
-| `SOURCE_ROWID`    | INTEGER | Individual sampling event identifier              |
-| `N_SOURCE_ROWIDS` | INTEGER | Number of `SOURCE_ROWID`s in this duplicate group |
-| `DATESTAMP`       | TEXT    | Date the query was run                            |
+| Column            | Type    | Description                                                              |
+| ----------------- | ------- | ------------------------------------------------------------------------ |
+| `TUPLE_ID`        | INTEGER | FK → `DUPLICATE_CANDIDATES.TUPLE_ID`                                     |
+| `SOURCE_ROWID`    | INTEGER | Individual sampling event identifier                                     |
+| `N_SOURCE_ROWIDS` | INTEGER | Number of `SOURCE_ROWID`s in this duplicate group                        |
+| `USE_SAMPLE`      | TEXT    | `'Y'` = retain, `'N'` = discard; defaults to `'Y'` on insert            |
+| `DATESTAMP`       | TEXT    | Date the row was created or last updated                                 |
+
+---
+
+### Step 43 — Create vw_duplicate_samples view
+
+```sql
+.read "43_create_vw_duplicate_samples.sql"
+```
+
+Creates the view **`vw_duplicate_samples`** — joins `DUPLICATE_SOURCE_ROWIDS` to `INTERIM_SAMPLES` on `SOURCE_ROWID`, surfacing the full sample metadata alongside each duplicate candidate's `TUPLE_ID` and `USE_SAMPLE` flag. Ordered by `TUPLE_ID` then `SOURCE_ROWID` so all members of each duplicate group appear together. Intended as the primary inspection tool for deciding which duplicates to retain (`USE_SAMPLE = 'Y'`) and which to discard (`USE_SAMPLE = 'N'`).
+
+---
+
+### Step 44 — Flag duplicates for removal in DUPLICATE_SOURCE_ROWIDS
+
+```sql
+.read "44_update_DUPLICATE_SOURCE_ROWIDS.sql"
+```
+
+For each `TUPLE_ID` where `N_SOURCE_ROWIDS = 2`, sets `USE_SAMPLE = 'N'` on the **smaller** (earlier) `SOURCE_ROWID`, leaving the larger (later) one with `USE_SAMPLE = 'Y'`. Groups with more than two members are left unchanged for manual review. Includes a preview `SELECT` before the `UPDATE` and verification queries after.
+
+---
+
+### Step 45 — Create vw_stoichiometry_inputs_deduped view
+
+```sql
+.read "45_create_vw_stoichiometry_inputs_deduped.sql"
+```
+
+Creates the view **`vw_stoichiometry_inputs_deduped`** — a clean, deduplicated version of `STOICHIOMETRY_INPUTS` that excludes any `SOURCE_ROWID` flagged as `USE_SAMPLE = 'N'` in `DUPLICATE_SOURCE_ROWIDS`. Intended as the primary input for all downstream stoichiometry analysis and plotting.
 
 ---
 
@@ -598,12 +628,14 @@ Individual `SOURCE_ROWID`s belonging to each duplicate candidate group.
 
 ### Views
 
-| View                     | Description                                                                                                                                 |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `vw_results_with_lookup` | Joins `RESULTS` to `PARAMETER_LOOKUP`, adding `NAME_TO_USE`, `SPECIES`, `ELEMENT`, `UNITS`, and `ELEMENT_MOLAR_MASS_G` to every result row |
-| `vw_DIN`                 | Calculates DIN as N per sampling event from `STOICHIOMETRY_NITROGEN`; includes a `COMPONENTS` column describing which fractions were summed  |
-| `vw_total_n`             | Derives total nitrogen as N per sampling event; prefers measured value, falls back to derived estimates; includes `COMPONENTS` column        |
-| `vw_source_rowid_stats`  | Aggregates `RESULTS` by `SOURCE_ROWID`, computing N, sum, mean, and population std dev of `NUMERIC_VALUE`                                   |
+| View                                  | Description                                                                                                                                 |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vw_results_with_lookup`              | Joins `RESULTS` to `PARAMETER_LOOKUP`, adding `NAME_TO_USE`, `SPECIES`, `ELEMENT`, `UNITS`, and `ELEMENT_MOLAR_MASS_G` to every result row |
+| `vw_DIN`                              | Calculates DIN as N per sampling event from `STOICHIOMETRY_NITROGEN`; includes a `COMPONENTS` column describing which fractions were summed  |
+| `vw_total_n`                          | Derives total nitrogen as N per sampling event; prefers measured value, falls back to derived estimates; includes `COMPONENTS` column        |
+| `vw_source_rowid_stats`               | Aggregates `RESULTS` by `SOURCE_ROWID`, computing N, sum, mean, and population std dev of `NUMERIC_VALUE`                                   |
+| `vw_duplicate_samples`                | Joins `DUPLICATE_SOURCE_ROWIDS` to `INTERIM_SAMPLES`, surfacing full metadata for each duplicate candidate group alongside `USE_SAMPLE`     |
+| `vw_stoichiometry_inputs_deduped`     | Filtered version of `STOICHIOMETRY_INPUTS` excluding rows where `USE_SAMPLE = 'N'` in `DUPLICATE_SOURCE_ROWIDS`; clean input for analysis  |
 
 ---
 
