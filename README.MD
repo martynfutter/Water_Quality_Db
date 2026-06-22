@@ -23,6 +23,7 @@ An end-to-end pipeline for ingesting Swedish freshwater monitoring data from Exc
 ├── 15 update_depth_from_undersokningstyp.sql  # Step 15  – Extract depth from UNDERSOKNINGSTYP
 ├── 16 update_depth_ytvatten.sql               # Step 16  – Assign default depth for 'ytvatten' samples
 ├── 17 update_depth_botten.sql                 # Step 17  – Assign default depth for 'botten' samples
+├── 18_create_DATA_SOURCES.sql                 # Step 18  – Create DATA_SOURCES lookup table
 ├── 20 create_LOCATIONS.sql                    # Step 20  – Create final deduplicated LOCATIONS table
 ├── 21_convert_rt90_to_sweref99.R              # Step 21  – Convert RT90 coordinates to SWEREF99TM
 ├── 22_update_locations_from_rt90.sql          # Step 22  – Write converted coordinates back to LOCATIONS
@@ -41,7 +42,10 @@ An end-to-end pipeline for ingesting Swedish freshwater monitoring data from Exc
 ├── 43_create_vw_duplicate_samples.sql         # Step 43  – View joining duplicate candidates to sample metadata
 ├── 44_update_DUPLICATE_SOURCE_ROWIDS.sql      # Step 44  – Flag smaller SOURCE_ROWID in each pair as discarded
 ├── 45_create_vw_stoichiometry_inputs_deduped.sql  # Step 45  – Deduplicated view of STOICHIOMETRY_INPUTS
+├── 50_create_SAMPLES.sql                      # Step 50  – Create curated SAMPLES table
+├── 51_create_vw_provdatum_mismatch.sql        # Step 51  – View flagging PROVDATUM vs date-component mismatches
 │
+├── map_interim_locations.R                    # Visualisation – Map of INTERIM_LOCATIONS sampling sites
 ├── .gitignore
 └── README.MD
 ```
@@ -107,41 +111,53 @@ Unpivots the 52 measurement columns of `RAW_DATA` into a long-format **`RESULTS`
 
 Run scripts **01 → 05** in order. Each targets only rows where `QC IS NULL`, so they are safe to re-run.
 
-| Script                           | What it does                                      | QC flag set    |
-| -------------------------------- | ------------------------------------------------- | -------------- |
-| `01 fix_comma_decimals.sql`      | Replaces European `,` decimal separator with `.`  | `COMMA FIXED`  |
-| `02 populate_numeric_values.sql` | Casts clean numeric strings to `NUMERIC_VALUE`    | `VALID NUMBER` |
-| `03 fix_detection_limits.sql`    | Parses `<X` → stores `X / 2` as the numeric value | `HALF DETECT`  |
-| `04 fix_bracketed_values.sql`    | Strips `[` `]` from values and casts to numeric   | `BRACKETS`     |
-| `05 delete_placeholder_rows.sql` | Deletes dummy rows (`XXXX…`, `Column…`)           | — (deleted)    |
-
-**R alternative:** `update_water_quality_db.R` performs the same logic as scripts 01–03 entirely in R using batched `UPDATE` statements via `DBI`, and may be preferable if you want to avoid the `sqlite3` CLI.
+| Script                            | Action                                                                 |
+| --------------------------------- | ---------------------------------------------------------------------- |
+| `01 fix_comma_decimals.sql`       | Replaces European decimal commas with periods in `TEXT_VALUE`          |
+| `02 populate_numeric_values.sql`  | Casts `TEXT_VALUE` to `NUMERIC_VALUE` where the value is a valid number |
+| `03 fix_detection_limits.sql`     | Converts `<X` detection-limit strings to `X/2` in `NUMERIC_VALUE`     |
+| `04 fix_bracketed_values.sql`     | Strips brackets from values such as `[0.5]`, writing `0.5`            |
+| `05 delete_placeholder_rows.sql`  | Deletes dummy or artefact rows (e.g. `XXXX`, `Column…`)               |
 
 ---
 
-### Steps 10–12 — Build normalised sample and location tables
+### Step 10 — Create INTERIM_SAMPLES table
 
 ```sql
 .read "10 create_INTERIM_SAMPLES.sql"
-.read "11 create_INTERIM_LOCATIONS.sql"
-.read "12 add_INTERIM_LOCATION_ID.sql"
 ```
 
-| Script                            | What it does                                                                                                                                                                                |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `10 create_INTERIM_SAMPLES.sql`   | Creates **`INTERIM_SAMPLES`** — one row per sampling event; the first 32 metadata columns from `RAW_DATA`, with missing values standardised to `'MISSING'`                                  |
-| `11 create_INTERIM_LOCATIONS.sql` | Creates **`INTERIM_LOCATIONS`** — one row per unique combination of the eight location-identifying columns; includes a `LOCATION_ID_TO_USE` column (default `−1`) for manual deduplication  |
-| `12 add_INTERIM_LOCATION_ID.sql`  | Adds `INTERIM_LOCATION_ID` to `INTERIM_SAMPLES` by joining on all eight location fields; a verification query confirms no unmatched rows                                                    |
+Creates **`INTERIM_SAMPLES`** from the first 32 metadata columns of `RAW_DATA`. All columns stored as `TEXT`; missing values (`NULL`, empty string, `'na'`, `'NA'`) standardised to `'MISSING'`.
 
 ---
 
-### Step 13 — Create SAMPLE_LOCATION_BACKBONE
+### Step 11 — Create INTERIM_LOCATIONS table
+
+```sql
+.read "11 create_INTERIM_LOCATIONS.sql"
+```
+
+Creates **`INTERIM_LOCATIONS`** by extracting distinct combinations of location-identifying columns from `INTERIM_SAMPLES`. Each unique location receives an auto-incremented `LOCATION_ID`. `LOCATION_ID_TO_USE` defaults to `−1` pending deduplication.
+
+---
+
+### Step 12 — Link samples back to locations
+
+```sql
+.read "12 add_INTERIM_LOCATION_ID.sql"
+```
+
+Adds an `INTERIM_LOCATION_ID` column to `INTERIM_SAMPLES` and populates it by joining back to `INTERIM_LOCATIONS` on the location-identifying columns.
+
+---
+
+### Step 13 — Create SAMPLE_LOCATION_BACKBONE table
 
 ```sql
 .read "13 create_SAMPLE_LOCATION_BACKBONE.sql"
 ```
 
-Creates **`SAMPLE_LOCATION_BACKBONE`** — a compact three-column cross-reference (`ROWID`, `INTERIM_LOCATION_ID`, `LOCATION_ID_TO_USE`) joining each sampling event to its resolved canonical location. Useful for downstream queries that need to respect the deduplication decisions recorded in `INTERIM_LOCATIONS`.
+Creates **`SAMPLE_LOCATION_BACKBONE`** — a compact cross-reference between each sampling event's `ROWID` and the `LOCATION_ID_TO_USE` from `INTERIM_LOCATIONS`. Useful for downstream queries that need to respect the deduplication decisions recorded in `INTERIM_LOCATIONS`.
 
 ---
 
@@ -157,6 +173,21 @@ These four scripts fill `MIN_PROVDJUP_M` and `MAX_PROVDJUP_M` where both columns
 | `17 update_depth_botten.sql`                 | `UNDERSOKNINGSTYP = 'botten'`   | Fixed assignment                                                                                                   | `20.0` m        |
 
 Each script appends a note to `PROVKOMMENTAR` recording how the depth was derived, and includes a preview `SELECT` so you can inspect affected rows before the `UPDATE` runs.
+
+---
+
+### Step 18 — Create DATA_SOURCES lookup table
+
+```sql
+.read "18_create_DATA_SOURCES.sql"
+```
+
+Creates **`DATA_SOURCES`** by extracting distinct `SOURCE_NAME` values from `INTERIM_SAMPLES` and assigning each a unique integer `DATA_SOURCE_ID`. Ordered alphabetically so IDs are stable across re-runs on the same data. Run after scripts 10–17 (`INTERIM_SAMPLES` must exist and be populated). An optional commented-out block at the end of the script adds a `DATA_SOURCE_ID` foreign-key column back to `INTERIM_SAMPLES`.
+
+| Column          | Type                        | Description                          |
+| --------------- | --------------------------- | ------------------------------------ |
+| `DATA_SOURCE_ID`| INTEGER (PK, AUTOINCREMENT) | System-generated primary key         |
+| `SOURCE_NAME`   | TEXT (UNIQUE)               | Original source file/dataset name    |
 
 ---
 
@@ -228,16 +259,6 @@ Creates the view **`vw_results_with_lookup`** — joins `RESULTS` to `PARAMETER_
 
 Creates **`STOICHIOMETRY_INPUTS`** — one row per sampling event that has a non-NULL `TOTAL_PHOSPHORUS` value, drawn from `vw_results_with_lookup`. Additional nutrient columns (`DIN`, `TOTAL_N` and their QC flags) are added by later steps (35–36).
 
-| Column             | Type         | Description                              |
-| ------------------ | ------------ | ---------------------------------------- |
-| `SOURCE_ROWID`     | INTEGER (PK) | Links to `RAW_DATA` and `RESULTS`        |
-| `DATESTAMP`        | TEXT         | Date/time the row was last updated       |
-| `TOTAL_PHOSPHORUS` | REAL         | Total phosphorus (µg/l P)                |
-| `DIN`              | REAL         | Dissolved inorganic nitrogen (µg/l N)    |
-| `DIN_QC`           | INTEGER      | FK → `COMPONENT_QC.COMPONENT_QC_ID`      |
-| `TOTAL_N`          | REAL         | Total nitrogen (µg/l N)                  |
-| `TOTAL_N_QC`       | INTEGER      | FK → `COMPONENT_QC.COMPONENT_QC_ID`      |
-
 ---
 
 ### Step 31 — Create STOICHIOMETRY_NITROGEN table
@@ -246,52 +267,18 @@ Creates **`STOICHIOMETRY_INPUTS`** — one row per sampling event that has a non
 .read "31_create_STOICHIOMETRY_NITROGEN.sql"
 ```
 
-Creates **`STOICHIOMETRY_NITROGEN`** — a wide-format (crosstab) staging table holding individual nitrogen fraction values per sampling event, pivoted from `vw_results_with_lookup` where `ELEMENT = 'NITROGEN'`. Used as the source for the DIN and total nitrogen views in steps 32–33.
-
-| Column                         | Description                        |
-| ------------------------------ | ---------------------------------- |
-| `SOURCE_ROWID`                 | INTEGER (PK); links to `RAW_DATA`  |
-| `DATESTAMP`                    | Date/time the row was populated    |
-| `AMMONIUM_AS_N`                | NH4-N (µg/l N)                     |
-| `NITRATE_AS_N`                 | NO3-N (µg/l N)                     |
-| `NITRITE_AS_N`                 | NO2-N (µg/l N)                     |
-| `ORGANIC_NITROGEN_AS_N`        | Org-N (µg/l N)                     |
-| `TOTAL_KJELDAHL_NITROGEN_AS_N` | Kjeldahl-N (µg/l N)                |
-| `TOTAL_NITROGEN`               | Tot-N (µg/l N)                     |
+Creates **`STOICHIOMETRY_NITROGEN`** — a wide-format staging table of nitrogen fraction values per sampling event, restricted to `SOURCE_ROWID`s already present in `STOICHIOMETRY_INPUTS`.
 
 ---
 
-### Step 32 — Create vw_DIN view
+### Steps 32–33 — Create nitrogen views
 
 ```sql
 .read "32_create_vw_DIN.sql"
-```
-
-Creates the view **`vw_DIN`** — calculates dissolved inorganic nitrogen (DIN) as N for each sampling event by summing available inorganic nitrogen fractions from `STOICHIOMETRY_NITROGEN`. The `COMPONENTS` column records which fractions were used.
-
-| Case | Fractions used                    |
-| ---- | --------------------------------- |
-| 1    | NH4-N + NO2-N + NO3-N (all three) |
-| 2    | NH4-N + NO3-N (NO2-N absent)      |
-| 3    | NO3-N only                        |
-
-Rows where `NITRATE_AS_N IS NULL` are excluded (no meaningful DIN can be computed).
-
----
-
-### Step 33 — Create vw_total_n view
-
-```sql
 .read "33_create_vw_total_n.sql"
 ```
 
-Creates the view **`vw_total_n`** — derives total nitrogen as N per sampling event from `STOICHIOMETRY_NITROGEN`, preferring a directly measured value and falling back through derived estimates.
-
-| Case | Source                                        |
-| ---- | --------------------------------------------- |
-| 1    | `TOTAL_NITROGEN` directly                     |
-| 2    | `TOTAL_KJELDAHL_NITROGEN_AS_N + NITRATE_AS_N` |
-| 3    | `ORGANIC_NITROGEN_AS_N + DIN` (from `vw_DIN`) |
+Creates two views that compute dissolved inorganic nitrogen (DIN) and total nitrogen from the components held in `STOICHIOMETRY_NITROGEN`.
 
 ---
 
@@ -301,33 +288,18 @@ Creates the view **`vw_total_n`** — derives total nitrogen as N per sampling e
 .read "34_create_COMPONENT_QC.sql"
 ```
 
-Creates and populates **`COMPONENT_QC`** — a lookup table of the distinct `COMPONENTS` strings found across `vw_DIN` and `vw_total_n`. Each unique string receives a system-generated integer primary key (`COMPONENT_QC_ID`) used as a quality-control foreign key in `STOICHIOMETRY_INPUTS`.
-
-| Column            | Type                        | Description                                      |
-| ----------------- | --------------------------- | ------------------------------------------------ |
-| `COMPONENT_QC_ID` | INTEGER (PK, AUTOINCREMENT) | System-generated primary key                     |
-| `COMPONENTS`      | TEXT                        | Description of nitrogen fractions used           |
-| `SOURCE_VIEW`     | TEXT                        | `vw_DIN`, `vw_total_n`, or `vw_DIN, vw_total_n` |
+Creates and populates **`COMPONENT_QC`** — a lookup table recording the distinct combinations of nitrogen fractions used when deriving DIN or total nitrogen, together with the source view name.
 
 ---
 
-### Step 35 — Add DIN and DIN_QC to STOICHIOMETRY_INPUTS
+### Steps 35–36 — Add nitrogen columns to STOICHIOMETRY_INPUTS
 
 ```sql
 .read "35_add_DIN_to_STOICHIOMETRY_INPUTS.sql"
-```
-
-Adds `DIN` (REAL) and `DIN_QC` (INTEGER) columns to `STOICHIOMETRY_INPUTS`, populating them from `vw_DIN` and `COMPONENT_QC` respectively. `DATESTAMP` is updated for all rows where a non-NULL DIN value was found.
-
----
-
-### Step 36 — Add TOTAL_N and TOTAL_N_QC to STOICHIOMETRY_INPUTS
-
-```sql
 .read "36_add_TOTAL_N_to_STOICHIOMETRY_INPUTS.sql"
 ```
 
-Adds `TOTAL_N` (REAL) and `TOTAL_N_QC` (INTEGER) columns to `STOICHIOMETRY_INPUTS`, populating them from `vw_total_n` and `COMPONENT_QC` respectively. `DATESTAMP` is updated for all rows where a non-NULL total nitrogen value was found.
+Script 35 adds `DIN` and `DIN_QC` columns; script 36 adds `TOTAL_N` and `TOTAL_N_QC` columns. Both join through `COMPONENT_QC` to record which nitrogen fractions were used for each row. `DATESTAMP` is updated for all rows where a non-NULL value was found.
 
 ---
 
@@ -405,6 +377,59 @@ For each `TUPLE_ID` where `N_SOURCE_ROWIDS = 2`, sets `USE_SAMPLE = 'N'` on the 
 ```
 
 Creates the view **`vw_stoichiometry_inputs_deduped`** — a clean, deduplicated version of `STOICHIOMETRY_INPUTS` that excludes any `SOURCE_ROWID` flagged as `USE_SAMPLE = 'N'` in `DUPLICATE_SOURCE_ROWIDS`. Intended as the primary input for all downstream stoichiometry analysis and plotting.
+
+---
+
+### Step 50 — Create SAMPLES table
+
+```sql
+.read "50_create_SAMPLES.sql"
+```
+
+Creates and populates **`SAMPLES`** — the primary curated sample-level table, drawing together:
+
+- Sample metadata from `INTERIM_SAMPLES` (dates, depths, identifiers)
+- `USE_SAMPLE` flag from `DUPLICATE_SOURCE_ROWIDS` (`'Y'` = keep, `'N'` = discard); samples with no entry in `DUPLICATE_SOURCE_ROWIDS` are not duplicates and default to `'Y'`
+- `DATA_SOURCE_ID` — FK to `DATA_SOURCES`, resolved by matching `INTERIM_SAMPLES.SOURCE_NAME → DATA_SOURCES.SOURCE_NAME`
+- `LOCATION_ID` — FK to `INTERIM_LOCATIONS`, resolved by matching `INTERIM_SAMPLES.INTERIM_LOCATION_ID → INTERIM_LOCATIONS.LOCATION_ID`
+
+Type conversions applied on insert: `PROVDATUM` is back-transformed from the Excel Windows serial number to an ISO date string (`YYYY-MM-DD`) using the epoch `1899-12-30`; year/month/day components are cast to `INTEGER`; depth columns are cast to `REAL`. `'MISSING'` and non-numeric values become `NULL`.
+
+| Column             | Type    | Description                                            |
+| ------------------ | ------- | ------------------------------------------------------ |
+| `ROWID`            | INTEGER (PK) | Matches `INTERIM_SAMPLES.ROWID`                   |
+| `USE_SAMPLE`       | TEXT    | `'Y'` = retain, `'N'` = discard                       |
+| `DATA_SOURCE_ID`   | INTEGER | FK → `DATA_SOURCES`                                   |
+| `LOCATION_ID`      | INTEGER | FK → `INTERIM_LOCATIONS`                              |
+| `PROV_ID`          | TEXT    | Sample identifier                                      |
+| `PROVDATUM`        | TEXT    | ISO date string (YYYY-MM-DD) converted from Excel serial |
+| `PROVTAGNINGSAR`   | INTEGER | Sampling year                                          |
+| `PROVTAGNINGSMANAD`| INTEGER | Sampling month                                         |
+| `PROVTAGNINGSDAG`  | INTEGER | Sampling day                                           |
+| `MIN_PROVDJUP_M`   | REAL    | Minimum sampling depth (m)                             |
+| `MAX_PROVDJUP_M`   | REAL    | Maximum sampling depth (m)                             |
+| `UNDERSOKNINGSTYP` | TEXT    | Investigation type                                     |
+| `PROVKOMMENTAR`    | TEXT    | Sample comment                                         |
+| `DATESTAMP`        | TEXT    | Date this script was run                               |
+
+---
+
+### Step 51 — Create vw_provdatum_mismatch view
+
+```sql
+.read "51_create_vw_provdatum_mismatch.sql"
+```
+
+Creates the view **`vw_provdatum_mismatch`** — identifies rows in `SAMPLES` where `PROVDATUM` (back-transformed from the Excel serial) does not match the date constructed from the three integer components `PROVTAGNINGSAR`, `PROVTAGNINGSMANAD`, `PROVTAGNINGSDAG`. Only rows where all five values are non-NULL are included; rows with any NULL value are excluded as a separate data-quality concern. Useful for catching edge cases where the Excel serial and the individual date columns are inconsistent.
+
+| Column             | Description                                                    |
+| ------------------ | -------------------------------------------------------------- |
+| `ROWID`            | FK → `SAMPLES.ROWID`                                           |
+| `PROVDATUM`        | Date as back-transformed from Excel serial                     |
+| `PROVTAGNINGSAR`   | Year component                                                 |
+| `PROVTAGNINGSMANAD`| Month component                                                |
+| `PROVTAGNINGSDAG`  | Day component                                                  |
+| `CONSTRUCTED_DATE` | Date built from components: `PRINTF('%04d-%02d-%02d', …)`      |
 
 ---
 
@@ -492,6 +517,17 @@ Compact cross-reference between sampling events and their canonical location.
 | `ROWID`               | INTEGER (PK) |
 | `INTERIM_LOCATION_ID` | INTEGER      |
 | `LOCATION_ID_TO_USE`  | INTEGER      |
+
+---
+
+#### `DATA_SOURCES`
+
+Lookup table of distinct data source names.
+
+| Column          | Type                        |
+| --------------- | --------------------------- |
+| `DATA_SOURCE_ID`| INTEGER (PK, AUTOINCREMENT) |
+| `SOURCE_NAME`   | TEXT (UNIQUE NOT NULL)      |
 
 ---
 
@@ -617,56 +653,86 @@ Groups of `SOURCE_ROWID`s that share identical summary statistics across all mea
 
 Individual `SOURCE_ROWID`s belonging to each duplicate candidate group.
 
-| Column            | Type    | Description                                       |
-| ----------------- | ------- | ------------------------------------------------- |
-| `TUPLE_ID`        | INTEGER | FK → `DUPLICATE_CANDIDATES.TUPLE_ID`              |
-| `SOURCE_ROWID`    | INTEGER | Individual sampling event identifier              |
-| `N_SOURCE_ROWIDS` | INTEGER | Number of `SOURCE_ROWID`s in this duplicate group |
-| `DATESTAMP`       | TEXT    | Date the query was run                            |
+| Column            | Type    | Description                                                              |
+| ----------------- | ------- | ------------------------------------------------------------------------ |
+| `TUPLE_ID`        | INTEGER | FK → `DUPLICATE_CANDIDATES.TUPLE_ID`                                     |
+| `SOURCE_ROWID`    | INTEGER | Individual sampling event identifier                                     |
+| `N_SOURCE_ROWIDS` | INTEGER | Number of `SOURCE_ROWID`s in this duplicate group                        |
+| `USE_SAMPLE`      | TEXT    | `'Y'` = retain, `'N'` = discard; defaults to `'Y'` on insert            |
+| `DATESTAMP`       | TEXT    | Date the row was created or last updated                                 |
+
+---
+
+#### `SAMPLES`
+
+Primary curated sample-level table combining metadata, deduplication flags, and foreign keys to `DATA_SOURCES` and `LOCATIONS`.
+
+| Column             | Type         | Description                                            |
+| ------------------ | ------------ | ------------------------------------------------------ |
+| `ROWID`            | INTEGER (PK) | Matches `INTERIM_SAMPLES.ROWID`                        |
+| `USE_SAMPLE`       | TEXT         | `'Y'` = retain, `'N'` = discard                        |
+| `DATA_SOURCE_ID`   | INTEGER      | FK → `DATA_SOURCES`                                    |
+| `LOCATION_ID`      | INTEGER      | FK → `INTERIM_LOCATIONS`                               |
+| `PROV_ID`          | TEXT         | Sample identifier                                      |
+| `PROVDATUM`        | TEXT         | ISO date (YYYY-MM-DD) converted from Excel serial      |
+| `PROVTAGNINGSAR`   | INTEGER      | Sampling year                                          |
+| `PROVTAGNINGSMANAD`| INTEGER      | Sampling month                                         |
+| `PROVTAGNINGSDAG`  | INTEGER      | Sampling day                                           |
+| `MIN_PROVDJUP_M`   | REAL         | Minimum sampling depth (m)                             |
+| `MAX_PROVDJUP_M`   | REAL         | Maximum sampling depth (m)                             |
+| `UNDERSOKNINGSTYP` | TEXT         | Investigation type                                     |
+| `PROVKOMMENTAR`    | TEXT         | Sample comment                                         |
+| `DATESTAMP`        | TEXT         | Date this script was run                               |
 
 ---
 
 ### Views
 
-| View                                  | Description                                                                                                                                 |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `vw_results_with_lookup`              | Joins `RESULTS` to `PARAMETER_LOOKUP`, adding `NAME_TO_USE`, `SPECIES`, `ELEMENT`, `UNITS`, and `ELEMENT_MOLAR_MASS_G` to every result row |
-| `vw_DIN`                              | Calculates DIN as N per sampling event from `STOICHIOMETRY_NITROGEN`; includes a `COMPONENTS` column describing which fractions were summed  |
-| `vw_total_n`                          | Derives total nitrogen as N per sampling event; prefers measured value, falls back to derived estimates; includes `COMPONENTS` column        |
-| `vw_source_rowid_stats`               | Aggregates `RESULTS` by `SOURCE_ROWID`, computing N, sum, mean, and population std dev of `NUMERIC_VALUE`                                   |
-| `vw_duplicate_samples`                | Joins `DUPLICATE_SOURCE_ROWIDS` to `INTERIM_SAMPLES`, surfacing full metadata for each duplicate candidate group alongside `USE_SAMPLE`     |
-| `vw_stoichiometry_inputs_deduped`     | Filtered version of `STOICHIOMETRY_INPUTS` excluding rows where `USE_SAMPLE = 'N'` in `DUPLICATE_SOURCE_ROWIDS`; clean input for analysis  |
+#### `vw_results_with_lookup`
+
+Joins `RESULTS` to `PARAMETER_LOOKUP` on `PARAMETER_NAME` (LEFT JOIN). Provides standardised parameter codes and units alongside raw result values.
 
 ---
 
-### Indexes
+#### `vw_DIN`
 
-| Index               | Table     | Column           |
-| ------------------- | --------- | ---------------- |
-| `idx_results_rowid` | `RESULTS` | `SOURCE_ROWID`   |
-| `idx_results_param` | `RESULTS` | `PARAMETER_NAME` |
+Computes dissolved inorganic nitrogen from components in `STOICHIOMETRY_NITROGEN`.
 
 ---
 
-## Parameter name mapping
+#### `vw_total_n`
 
-`PARAMETER_LOOKUP` maps the sanitised Swedish column headers from `RAW_DATA` to standardised English parameter codes and units. A representative sample of entries is shown below.
-
-| Original column header  | `NAME_TO_USE`                  | Units |
-| ----------------------- | ------------------------------ | ----- |
-| `Tot-P (µg/l P)`        | `TOTAL_PHOSPHORUS`             | µg/l  |
-| `Tot-N (µg/l N)`        | `TOTAL_NITROGEN`               | µg/l  |
-| `NO2+NO3-N (µg/l N)`    | `NITRATE_AS_N`                 | µg/l  |
-| `NH4-N (µg/l N)`        | `AMMONIUM_AS_N`                | µg/l  |
-| `NO2-N (µg/l N)`        | `NITRITE_AS_N`                 | µg/l  |
-| `Kjeld.-N (µg/l N)`     | `TOTAL_KJELDAHL_NITROGEN_AS_N` | µg/l  |
-| `Org-N (µg/l N)`        | `ORGANIC_NITROGEN_AS_N`        | µg/l  |
-| `Vattentemperatur (°C)` | `TEMPERATURE`                  | °C    |
-| `Siktdjup (m)`          | `SECCHI`                       | m     |
-| `pH`                    | `PH`                           | —     |
+Computes total nitrogen from components in `STOICHIOMETRY_NITROGEN`.
 
 ---
 
-## Data source
+#### `vw_source_rowid_stats`
 
-The data originate from the **Swedish national freshwater monitoring programme** and are stored using the original Swedish column naming convention used by the data provider. All coordinates are in **SWEREF99TM (EPSG:3006)**, or are converted to that system during the pipeline (steps 21–22 handle legacy RT90 coordinates).
+Aggregates `RESULTS` by `SOURCE_ROWID`; the basis for duplicate detection.
+
+---
+
+#### `vw_duplicate_samples`
+
+Joins `DUPLICATE_SOURCE_ROWIDS` to `INTERIM_SAMPLES`; primary inspection tool for duplicate review.
+
+---
+
+#### `vw_stoichiometry_inputs_deduped`
+
+Deduplicated version of `STOICHIOMETRY_INPUTS`; excludes rows flagged `USE_SAMPLE = 'N'`.
+
+---
+
+#### `vw_provdatum_mismatch`
+
+Identifies rows in `SAMPLES` where the back-transformed `PROVDATUM` disagrees with the date constructed from `PROVTAGNINGSAR`, `PROVTAGNINGSMANAD`, and `PROVTAGNINGSDAG`. Rows with any NULL in the five compared fields are excluded.
+
+| Column             | Description                                                    |
+| ------------------ | -------------------------------------------------------------- |
+| `ROWID`            | FK → `SAMPLES.ROWID`                                           |
+| `PROVDATUM`        | Date as back-transformed from Excel serial                     |
+| `PROVTAGNINGSAR`   | Year component                                                 |
+| `PROVTAGNINGSMANAD`| Month component                                                |
+| `PROVTAGNINGSDAG`  | Day component                                                  |
+| `CONSTRUCTED_DATE` | Date built from components: `PRINTF('%04d-%02d-%02d', …)`      |
