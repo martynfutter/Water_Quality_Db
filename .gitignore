@@ -5,4 +5,5 @@
 *.xlsx
 *.db
 *.db-journal
+*.csv
 plots/
