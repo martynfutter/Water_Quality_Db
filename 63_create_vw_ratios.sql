@@ -26,6 +26,7 @@ CREATE VIEW vw_ratios AS
 SELECT
     SOURCE_ROWID,
     N_FORM,
+    NITROGEN,
     TOTAL_PHOSPHORUS,
     N,
     P,
